@@ -22,6 +22,19 @@ class EventChannelNativeSpeechRecognition extends NativeSpeechRecognitionPlatfor
           if(event == null){
             return;
           }
+          // 透传原生层错误信息(如 SFSpeech kLSRErrorDomain).
+          // 错误事件不参与文本去重逻辑.
+          if(event is Map && event['error'] != null){
+            final err = event['error'];
+            sink.add({
+              'error': {
+                'domain': err['domain'],
+                'code': err['code'],
+                'message': err['message'],
+              }
+            });
+            return;
+          }
           final currentText = event['text'] as String ?? "";
           if(lastText.isEmpty || currentText.startsWith(lastText)){
             sink.add({

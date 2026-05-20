@@ -165,9 +165,17 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
                      "isFinal": result.isFinal
                 ])
             }
-            if error != nil {
+            if let error = error as NSError? {
                 self.stop()
-                self.resultHandler.sendResult(nil)
+                // 把 NSError 透传给 Flutter 端, 让上层识别如
+                // kLSRErrorDomain code=201 (Siri/Dictation disabled) 等场景
+                self.resultHandler.sendResult([
+                    "error": [
+                        "domain": error.domain,
+                        "code": error.code,
+                        "message": error.localizedDescription
+                    ]
+                ])
                 flutterResult(nil)
                 print(error)
             }
