@@ -13,6 +13,9 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
   private var authorized: Bool = false
   private var recognizedText: String = ""
   private var currentLocale: Locale = Locale.current
+  // 识别任务自动重启计数(见 handleRecognitionError), 每次 start()/stop() 复位
+  private var restartCount = 0
+  private let maxRestartCount = 3
 
 
   public static func register(with registrar: FlutterPluginRegistrar) {
@@ -39,16 +42,19 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
     case "getPlatformVersion":
       result("iOS " + UIDevice.current.systemVersion)
     case "start":
-        self.getPermissions{
+        self.getPermissions{ granted in
+            // 未授权也必须回 result: 否则 Dart 端 await start() 永久挂起,
+            // 调用方(录音页)的启动防抖标记卡死, 页面内无法再触发录音
+            guard granted else {
+                result(FlutterError(code: "PERMISSION_DENIED",
+                                    message: "Speech recognition authorization denied or restricted",
+                                    details: nil))
+                return
+            }
             do {
-                guard self.authorized else {
-                     result("")
-                        return
-                     }
-
                 try self.start(flutterResult: result)
             } catch {
-                result("")
+                result(FlutterError(code: "START_FAILED", message: "\(error)", details: nil))
             }
         }
         break
@@ -95,69 +101,31 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
     public func start(flutterResult: @escaping FlutterResult) throws {
         recognitionTask?.cancel()
         self.recognitionTask = nil
+        restartCount = 0
 
         if speechRecognizer?.locale.identifier != currentLocale.identifier {
             speechRecognizer = SFSpeechRecognizer(locale: currentLocale)
         }
 
-//        let audioSession = AVAudioSession.sharedInstance()
-//
-//        try audioSession.setCategory(
-//                .playAndRecord,
-//                mode: .spokenAudio,
-//                options: [.allowBluetooth, .duckOthers]
-//        )
-//
-//        try audioSession.setPreferredSampleRate(16000)
-//        try audioSession.setPreferredIOBufferDuration(0.016)
-//        if audioSession.isInputGainSettable {
-//            try audioSession.setInputGain(1.0)
-//        }
-//        try audioSession.setActive(true)
+        startRecognitionTask()
+        flutterResult(nil)
+    }
 
-//        let inputNode = audioEngine.inputNode
-//
-//        var setting = audioEngine.inputNode.inputFormat(forBus: 0).settings
-//        setting[AVLinearPCMBitDepthKey] = 16
-//        setting[AVSampleRateKey] = 16000
-//        setting[AVLinearPCMIsFloatKey] = 0
-//
-//        inputNode.removeTap(onBus: 0)
-//
-//        let recordingFormat = AVAudioFormat.init(settings: setting)
-
-//        inputNode.installTap(onBus: 0, bufferSize: 1600, format: recordingFormat) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
-//            self.recognitionRequest?.append(buffer)
-//
-//            let format = buffer.format
-//            let pcmData = self.extractData(from: buffer)
-//
-//            let resultDict: [String: Any] = [
-//                "sampleRate": format.sampleRate,
-//                "channelCount": format.channelCount,
-//                "data": pcmData
-//            ]
-//
-//            self.audioDataHandler.sendResult(resultDict)
-//        }
-//
-//        audioEngine.prepare()
-//        try audioEngine.start()
-
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else {
-            fatalError("Unable to create a SFSpeechAudioBufferRecognitionRequest object")
-        }
-
-        recognitionRequest.shouldReportPartialResults = true
+    /// 创建识别请求并启动识别任务; [sendAudioData] 始终写入当前 recognitionRequest,
+    /// 重建后自动衔接, 无需 Flutter 端感知
+    private func startRecognitionTask() {
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
 
         if #available(iOS 13, *) {
             if speechRecognizer?.supportsOnDeviceRecognition ?? false{
-                recognitionRequest.requiresOnDeviceRecognition = true
+                request.requiresOnDeviceRecognition = true
             }
         }
 
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
+        recognitionRequest = request
+        recognitionTask = speechRecognizer?.recognitionTask(with: request) { [weak self] result, error in
+            guard let self = self else { return }
             if let result = result {
                 let bestTranscription = result.bestTranscription.formattedString
                 self.resultHandler.sendResult([
@@ -166,21 +134,43 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
                 ])
             }
             if let error = error as NSError? {
-                self.stop()
-                // 把 NSError 透传给 Flutter 端, 让上层识别如
-                // kLSRErrorDomain code=201 (Siri/Dictation disabled) 等场景
-                self.resultHandler.sendResult([
-                    "error": [
-                        "domain": error.domain,
-                        "code": error.code,
-                        "message": error.localizedDescription
-                    ]
-                ])
-                flutterResult(nil)
-                print(error)
+                self.handleRecognitionError(error)
             }
         }
-        flutterResult(nil)
+    }
+
+    /// 识别出错处理: 授权刚授予瞬间 SFSpeech 服务未就绪、网络抖动等会立刻报错,
+    /// 若直接销毁请求, 后续音频全部被丢弃且无任何提示(首装第一次进录音页
+    /// "无转写"的根因)。可重试错误自动重建识别任务续传, 超限才终止并透传。
+    private func handleRecognitionError(_ error: NSError) {
+        if isRetryable(error) && restartCount < maxRestartCount {
+            restartCount += 1
+            print("SpeechRecognition error \(error.domain)/\(error.code), restart \(restartCount)/\(maxRestartCount)")
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            startRecognitionTask()
+            return
+        }
+        stop()
+        // 把 NSError 透传给 Flutter 端, 让上层识别如
+        // kLSRErrorDomain code=201 (Siri/Dictation disabled) 等场景
+        self.resultHandler.sendResult([
+            "error": [
+                "domain": error.domain,
+                "code": error.code,
+                "message": error.localizedDescription
+            ]
+        ])
+        print(error)
+    }
+
+    /// 可自动重试的错误: kAFAssistantErrorDomain
+    /// 1101(网络错误) / 203(静音段 skipped) / 209(连接中断)
+    private func isRetryable(_ error: NSError) -> Bool {
+        if error.domain == "kAFAssistantErrorDomain" {
+            return [1101, 203, 209].contains(error.code)
+        }
+        return false
     }
 
     func sendAudioData(data: Data, sampleRate: Double) {
@@ -234,19 +224,17 @@ public class NativeSpeechRecognitionPlugin: NSObject, FlutterPlugin {
         self.recognitionRequest = nil
         self.recognitionTask?.cancel()
         self.recognitionTask = nil
+        restartCount = 0
     }
 
-    public func getPermissions(callback: @escaping () -> Void){
+    public func getPermissions(callback: @escaping (Bool) -> Void){
         SFSpeechRecognizer.requestAuthorization{authStatus in
             OperationQueue.main.addOperation {
-               switch authStatus {
-                    case .authorized:
-                        self.authorized = true
-                        callback()
-                        break
-                    default:
-                        break
-               }
+                // 所有授权状态都必须回调: 旧实现非 authorized 时 callback 不调用,
+                // method channel 的 result 悬空, Dart 端 await start() 永久挂起
+                let granted = (authStatus == .authorized)
+                self.authorized = granted
+                callback(granted)
             }
         }
     }
